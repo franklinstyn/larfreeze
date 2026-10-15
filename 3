@@ -1,0 +1,63 @@
+from pathlib import Path
+
+BOT_NAME = "gmaps"
+SPIDER_MODULES = ["gmaps.spiders"]
+NEWSPIDER_MODULE = "gmaps.spiders"
+
+
+ROBOTSTXT_OBEY = False
+
+CONCURRENT_REQUESTS = 1
+DOWNLOAD_DELAY = 0
+AUTOTHROTTLE_ENABLED = False
+RETRY_ENABLED = False
+LOG_LEVEL = "INFO"
+
+
+SEARCH_QUERY = "restaurants in Lahore"
+RESTAURANT_LIMIT = 40
+REVIEWS_PER_PLACE = 10         
+
+RESTAURANT_CATEGORY_KEYWORDS = [
+    "restaurant", "cafe", "café", "coffee", "food", "pizza", "burger", "bakery",
+    "grill", "bbq", "barbecue", "dhaba", "eatery", "diner", "kitchen", "buffet",
+    "steak", "sushi", "tea house", "ice cream", "dessert",
+]
+
+
+SELENIUM_HEADLESS = True
+ACTION_DELAY = (0.8, 1.8)      
+PLACE_DELAY = (2.0, 5.0)       
+ENABLE_JSON = True
+ENABLE_CSV = True
+ENABLE_PARQUET = True
+
+ENABLE_MYSQL_FLAT = False
+ENABLE_MYSQL_RELATIONAL = False
+ENABLE_FILE_TO_MYSQL = False
+
+ITEM_PIPELINES = {
+    "gmaps.pipelines.ScrapeDatePipeline": 50,
+}
+if ENABLE_JSON:
+    ITEM_PIPELINES["gmaps.pipelines.JsonPipeline"] = 100
+if ENABLE_CSV:
+    ITEM_PIPELINES["gmaps.pipelines.CsvPipeline"] = 200
+if ENABLE_PARQUET:
+    ITEM_PIPELINES["gmaps.pipelines.ParquetPipeline"] = 300
+if ENABLE_MYSQL_FLAT:
+    ITEM_PIPELINES["gmaps.pipelines.MySQLFlatPipeline"] = 400
+if ENABLE_MYSQL_RELATIONAL:
+    ITEM_PIPELINES["gmaps.pipelines.MySQLRelationalPipeline"] = 500
+if ENABLE_FILE_TO_MYSQL:
+    ITEM_PIPELINES["gmaps.pipelines.FileToMySQLPipeline"] = 600
+
+EXPORT_DIR = str(Path(__file__).resolve().parents[1] / "output")
+PARQUET_BATCH_SIZE = 20
+MODEL_MODULE = "gmaps.models"
+
+MYSQL_CONNECTION = "mysql+pymysql://user:password@localhost:3306/gmaps?charset=utf8mb4"
+MYSQL_FILE_CONNECTION = None
+MYSQL_FILE_TABLE_PREFIX = "file_"
+MYSQL_FILE_FORMAT = "csv"
+FILE_BATCH_SIZE = 1000

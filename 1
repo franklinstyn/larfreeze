@@ -1,0 +1,131 @@
+from typing import Optional
+
+from sqlalchemy import Float, ForeignKeyConstraint, Integer, String, Text
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+LongText = Text().with_variant(MEDIUMTEXT(), "mysql")
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class InfoColumns:
+    scrape_timestamp: Mapped[Optional[str]] = mapped_column(String(100))
+    search_query: Mapped[Optional[str]] = mapped_column(String(255))
+    search_rank: Mapped[Optional[int]] = mapped_column(Integer) 
+    name: Mapped[Optional[str]] = mapped_column(String(255))
+    category: Mapped[Optional[str]] = mapped_column(String(255))
+    rating: Mapped[Optional[float]] = mapped_column(Float)
+    review_count: Mapped[Optional[int]] = mapped_column(Integer)
+    price_range: Mapped[Optional[str]] = mapped_column(String(100))  
+    address: Mapped[Optional[str]] = mapped_column(String(500))
+    phone: Mapped[Optional[str]] = mapped_column(String(100))
+    website: Mapped[Optional[str]] = mapped_column(Text)
+    plus_code: Mapped[Optional[str]] = mapped_column(String(255))
+    maps_url: Mapped[Optional[str]] = mapped_column(Text)
+
+
+class AboutColumns:
+
+    about_service_options: Mapped[Optional[str]] = mapped_column(Text)
+    about_highlights: Mapped[Optional[str]] = mapped_column(Text)
+    about_popular_for: Mapped[Optional[str]] = mapped_column(Text)
+    about_accessibility: Mapped[Optional[str]] = mapped_column(Text)
+    about_offerings: Mapped[Optional[str]] = mapped_column(Text)
+    about_dining_options: Mapped[Optional[str]] = mapped_column(Text)
+    about_amenities: Mapped[Optional[str]] = mapped_column(Text)
+    about_atmosphere: Mapped[Optional[str]] = mapped_column(Text)
+    about_crowd: Mapped[Optional[str]] = mapped_column(Text)
+    about_planning: Mapped[Optional[str]] = mapped_column(Text)
+    about_payments: Mapped[Optional[str]] = mapped_column(Text)
+    about_children: Mapped[Optional[str]] = mapped_column(Text)
+    about_parking: Mapped[Optional[str]] = mapped_column(Text)
+    about_pets: Mapped[Optional[str]] = mapped_column(Text)
+    about_other: Mapped[Optional[str]] = mapped_column(Text) 
+
+
+class HoursColumns:
+    """Raw opening-hours text per weekday, exactly as Maps shows it."""
+    monday_timing: Mapped[Optional[str]] = mapped_column(String(255))
+    tuesday_timing: Mapped[Optional[str]] = mapped_column(String(255))
+    wednesday_timing: Mapped[Optional[str]] = mapped_column(String(255))
+    thursday_timing: Mapped[Optional[str]] = mapped_column(String(255))
+    friday_timing: Mapped[Optional[str]] = mapped_column(String(255))
+    saturday_timing: Mapped[Optional[str]] = mapped_column(String(255))
+    sunday_timing: Mapped[Optional[str]] = mapped_column(String(255))
+    # JSON {section title: {day: timing}} for extra sections such as Takeout / Brunch
+    other_hours: Mapped[Optional[str]] = mapped_column(Text)
+
+
+class RestaurantFlat(InfoColumns, AboutColumns, HoursColumns, Base):
+    __tablename__ = "restaurants_flat"
+
+    initial_scraped_date: Mapped[str] = mapped_column(String(10), primary_key=True)
+    place_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+
+    latest_scraped_date: Mapped[str] = mapped_column(String(10))
+    reviews: Mapped[Optional[str]] = mapped_column(LongText) 
+
+
+class Restaurant(InfoColumns, AboutColumns, Base):
+    """One current row per restaurant (updated when a new day is scraped)."""
+    __tablename__ = "restaurants"
+
+    place_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+
+    initial_scraped_date: Mapped[str] = mapped_column(String(10))
+    latest_scraped_date: Mapped[str] = mapped_column(String(10))
+
+
+class RestaurantHours(HoursColumns, Base):
+    """Opening hours, one row per restaurant per day."""
+    __tablename__ = "restaurant_hours"
+
+    place_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    initial_scraped_date: Mapped[str] = mapped_column(String(10), primary_key=True)
+
+    latest_scraped_date: Mapped[str] = mapped_column(String(10))
+    scrape_timestamp: Mapped[Optional[str]] = mapped_column(String(100))
+
+    # table-level FK (not inline) so file-to-MySQL can clone the table
+    __table_args__ = (ForeignKeyConstraint(["place_id"], ["restaurants.place_id"]),)
+
+
+class RestaurantReviews(Base):
+    """Daily snapshot: rating, review count and the newest reviews (JSON list)."""
+    __tablename__ = "restaurant_reviews"
+
+    place_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    initial_scraped_date: Mapped[str] = mapped_column(String(10), primary_key=True)
+
+    latest_scraped_date: Mapped[str] = mapped_column(String(10))
+    scrape_timestamp: Mapped[Optional[str]] = mapped_column(String(100))
+    rating: Mapped[Optional[float]] = mapped_column(Float)
+    review_count: Mapped[Optional[int]] = mapped_column(Integer)
+    reviews: Mapped[Optional[str]] = mapped_column(LongText)
+
+    __table_args__ = (ForeignKeyConstraint(["place_id"], ["restaurants.place_id"]),)
+
+
+PIPELINE_CONFIG = {
+    "dates": {
+        "timestamp_column": "scrape_timestamp",
+        "initial_column": "initial_scraped_date",
+        "latest_column": "latest_scraped_date",
+    },
+    "export": {"model": RestaurantFlat},
+    "flat": {
+        "tables": [
+            {"model": RestaurantFlat, "mode": "insert_ignore"},
+        ],
+    },
+    "relational": {
+        "tables": [
+            {"model": Restaurant, "mode": "upsert"},
+            {"model": RestaurantHours, "mode": "insert_ignore"},
+            {"model": RestaurantReviews, "mode": "insert_ignore"},
+        ],
+    },
+}

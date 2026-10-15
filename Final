@@ -1,0 +1,445 @@
+import csv
+import json
+import random
+import re
+import time
+from datetime import datetime, timezone
+from urllib.parse import quote_plus
+
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+
+# Run settings
+SEARCH_QUERY = "restaurants in Lahore"
+RESTAURANT_LIMIT = 40
+REVIEWS_PER_PLACE = 10
+CSV_FILE = "gmaps_restaurants.csv"
+HEADLESS = True
+CATEGORY_KEYWORDS = ["restaurant", "cafe", "fast food", "pizza", "bakery"]
+ACTION_DELAY = (0.8, 1.8)
+PLACE_DELAY = (2.0, 5.0)
+
+DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+HOURS_COLUMNS = {day: day + "_timing" for day in DAYS}
+PLACE_ID_RE = re.compile(r"!1s(0x[0-9a-fA-F]+:0x[0-9a-fA-F]+)")
+PUA_RE = re.compile("[\ue000-\uf8ff]")
+NEGATIVE_RE = re.compile(r"^(no|not|doesn't|does not|isn't|is not|without)\b", re.I)
+PRICE_RE = re.compile(
+    r"(?:(?:Rs\.?|PKR|â‚¨|\$|â‚¬|Â£)\s?\d[\d,]*(?:\s?[â€“-]\s?\d[\d,]*)?\+?)|(?<!\S)\${1,4}(?!\S)",
+    re.I,
+)
+
+SEL = {
+    "consent": '//button[contains(normalize-space(.),"Accept all") or contains(normalize-space(.),"Reject all")]',
+    "feed": '//div[@role="feed"]',
+    "heading": "//h1",
+    "end": '//span[contains(text(),"reached the end")]',
+    "hours_button": '//button[@data-item-id="oh"]',
+    "hours_table": "//table[.//td]",
+    "hours_toggle": '//div[@role="button"][@aria-expanded="false"][contains(@jsaction,"openhours")]',
+    "back": '//button[@aria-label="Back"]',
+    "review_card": '//div[@data-review-id][not(ancestor::div[@data-review-id])]',
+    "sort": '//button[contains(@aria-label,"Sort") or @data-value="Sort" or normalize-space(.)="Sort"]',
+    "newest": '//*[@role="menuitemradio"][contains(normalize-space(.),"Newest")]',
+    "more": '//div[@data-review-id]//button[contains(@aria-label,"See more") or normalize-space(.)="More"]',
+}
+
+
+def clean(value):
+    if value is None:
+        return None
+    value = PUA_RE.sub("", str(value))
+    value = value.replace("\u202f", " ").replace("\u00a0", " ").replace("\u2009", " ")
+    value = re.sub(r"\s+", " ", value).strip()
+    return value or None
+
+
+def number(value, integer=False):
+    match = re.search(r"\d[\d,]*\.?\d*", value or "")
+    if not match:
+        return None
+    result = float(match.group(0).replace(",", ""))
+    return int(result) if integer else result
+
+
+def text(parent, xpath):
+    elements = parent.find_elements(By.XPATH, xpath)
+    return clean(elements[0].text) if elements else None
+
+
+def attr(parent, xpath, name):
+    elements = parent.find_elements(By.XPATH, xpath)
+    return clean(elements[0].get_attribute(name)) if elements else None
+
+
+def strip_label(value, prefix):
+    value = clean(value)
+    if value and value.lower().startswith(prefix.lower()):
+        return clean(value[len(prefix):])
+    return value
+
+
+def place_id(url):
+    match = PLACE_ID_RE.search(url or "")
+    return match.group(1) if match else None
+
+
+def english_url(url):
+    if "hl=en" in url:
+        return url
+    return url + ("&" if "?" in url else "?") + "hl=en"
+
+
+def tab_xpath(label):
+    return '//button[@role="tab"][starts-with(@aria-label,"%s") or normalize-space(.)="%s"]' % (label, label)
+
+
+def parse_price(driver):
+    for element in driver.find_elements(By.XPATH, '//span[@role="img"]'):
+        value = clean(element.text)
+        if value and PRICE_RE.fullmatch(value):
+            return value
+    for element in driver.find_elements(By.XPATH, "//*[@aria-label]"):
+        label = clean(element.get_attribute("aria-label"))
+        if label and label.lower().startswith("price"):
+            return strip_label(label, "Price:") or strip_label(label, "Price")
+    main = driver.find_elements(By.XPATH, '//div[@role="main"]')
+    if main:
+        match = PRICE_RE.search(clean(main[0].text) or "")
+        if match:
+            return clean(match.group(0))
+    return None
+
+
+def parse_overview(driver):
+    rating_label = attr(driver, '//span[@role="img"][contains(@aria-label,"stars")]', "aria-label")
+    return {
+        "name": text(driver, '//h1[contains(@class,"DUwDvf")]') or text(driver, "//h1"),
+        "category": text(driver, '//button[contains(@jsaction,"category")]'),
+        "rating": number(text(driver, '//div[contains(@class,"F7nice")]//span[@aria-hidden="true"]') or rating_label),
+        "review_count": number(
+            attr(driver, '//div[contains(@class,"F7nice")]//span[contains(@aria-label,"review")]', "aria-label"),
+            integer=True,
+        ),
+        "price_range": parse_price(driver),
+        "address": strip_label(attr(driver, '//button[@data-item-id="address"]', "aria-label"), "Address:"),
+        "phone": strip_label(attr(driver, '//button[starts-with(@data-item-id,"phone:tel:")]', "aria-label"), "Phone:"),
+        "website": attr(driver, '//a[@data-item-id="authority"]', "href"),
+        "plus_code": strip_label(attr(driver, '//button[@data-item-id="oloc"]', "aria-label"), "Plus code:"),
+    }
+
+
+def parse_hours(driver):
+    sections, seen = [], set()
+    for table in driver.find_elements(By.XPATH, "//table[.//td]"):
+        days = {}
+        for row in table.find_elements(By.XPATH, ".//tr[td]"):
+            cells = row.find_elements(By.XPATH, "./td")
+            if len(cells) < 2:
+                continue
+            day = (clean(cells[0].text) or "").lower()
+            if day not in HOURS_COLUMNS:
+                continue
+            parts = [clean(li.text) for li in cells[1].find_elements(By.XPATH, ".//li")]
+            parts = [part for part in parts if part]
+            days[day] = ", ".join(parts) if parts else clean(cells[1].text)
+        if not days:
+            continue
+        try:
+            title = clean(table.find_element(
+                By.XPATH, 'ancestor::div[contains(@class,"OqCZI")][1]//div[@role="button"][1]'
+            ).text)
+        except WebDriverException:
+            title = None
+        key = (title, tuple(sorted(days.items())))
+        if key not in seen:
+            seen.add(key)
+            sections.append((title, days))
+
+    columns = {column: None for column in HOURS_COLUMNS.values()}
+    other = {}
+    for index, (title, days) in enumerate(sections):
+        if index == 0:
+            for day, timing in days.items():
+                columns[HOURS_COLUMNS[day]] = timing
+        else:
+            other[title or "section %d" % (index + 1)] = days
+    return columns, other
+
+
+def parse_reviews(driver, limit):
+    reviews, seen = [], set()
+    for card in driver.find_elements(By.XPATH, SEL["review_card"]):
+        review_id = card.get_attribute("data-review-id")
+        if review_id in seen:
+            continue
+        seen.add(review_id)
+        parts = [
+            span.text for span in card.find_elements(
+                By.XPATH,
+                './/span[contains(@class,"wiI7pd")][not(ancestor::div[contains(@class,"CDe7pd")])]',
+            ) if span.text
+        ]
+        reviews.append({
+            "reviewer_name": text(card, './/div[contains(@class,"d4r55")]'),
+            "rating": number(attr(card, './/span[@role="img"][contains(@aria-label,"star")]', "aria-label")),
+            "date": text(card, './/span[contains(@class,"rsqaWe")]'),
+            "text": clean(" ".join(parts)),
+        })
+        if len(reviews) >= limit:
+            break
+    return reviews
+
+
+def parse_about(driver):
+    # The About tab is open, so query its container directly instead of trying several page scopes.
+    headings = driver.find_elements(
+        By.XPATH,
+        '//div[@role="region"][starts-with(@aria-label,"About")]'
+        '//h2[following-sibling::ul] | '
+        '//div[@role="region"][starts-with(@aria-label,"About")]'
+        '//*[contains(@class,"iL3Qke")][following-sibling::ul]',
+    )
+    sections = {}
+    for heading in headings:
+        title = clean(heading.text)
+        if not title:
+            continue
+        items = []
+        for li in heading.find_elements(By.XPATH, "./following-sibling::ul[1]/li"):
+            labels = [
+                clean(span.get_attribute("aria-label"))
+                for span in li.find_elements(By.XPATH, ".//span[@aria-label]")
+            ]
+            label = clean(" ".join(value for value in labels if value))
+            if label and NEGATIVE_RE.match(label):
+                continue
+            parts = [span.text for span in li.find_elements(By.XPATH, ".//span[@aria-label]") if span.text]
+            value = clean(" ".join(parts)) or clean(li.text) or label
+            if value:
+                items.append(value)
+        if items:
+            sections.setdefault(title, items)
+    return sections
+
+
+class GmapsRestaurantScraper:
+    def __init__(self):
+        options = webdriver.ChromeOptions()
+        if HEADLESS:
+            options.add_argument("--headless=new")
+        options.add_argument("--window-size=1400,1000")
+        options.add_argument("--lang=en-US")
+        options.add_experimental_option("prefs", {"intl.accept_languages": "en-US,en"})
+        self.driver = webdriver.Chrome(options=options)
+        self.scraped_at = datetime.now(timezone.utc).isoformat()
+
+    def pause(self, low=None, high=None):
+        low, high = (low, high) if low is not None else ACTION_DELAY
+        time.sleep(random.uniform(float(low), float(high)))
+
+    def wait(self, xpath, seconds=15):
+        return WebDriverWait(self.driver, seconds).until(
+            EC.presence_of_element_located((By.XPATH, xpath))
+        )
+
+    def click(self, element):
+        self.driver.execute_script("arguments[0].click();", element)
+
+    def open_search(self):
+        self.driver.get("https://www.google.com/maps/search/%s?hl=en" % quote_plus(SEARCH_QUERY))
+        try:
+            self.click(self.wait(SEL["consent"], 4))
+            self.pause()
+        except TimeoutException:
+            pass
+        self.wait(SEL["feed"], 20)
+
+    def collect_links(self, wanted):
+        links, seen, idle = [], set(), 0
+        while len(links) < wanted and idle < 4:
+            feed = self.driver.find_element(By.XPATH, SEL["feed"])
+            hrefs = self.driver.execute_script(
+                "return Array.from(arguments[0].querySelectorAll('a[href*=\"/maps/place/\"]')).map(a => a.href);",
+                feed,
+            )
+            grew = False
+            for href in hrefs:
+                key = place_id(href) or href
+                if key not in seen:
+                    seen.add(key)
+                    links.append(href)
+                    grew = True
+            if self.driver.find_elements(By.XPATH, SEL["end"]):
+                break
+            idle = 0 if grew else idle + 1
+            self.driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", feed)
+            self.pause(1.0, 2.0)
+        return links
+
+    def click_tab(self, label):
+        try:
+            self.click(self.wait(tab_xpath(label), 10))
+            self.pause()
+            return True
+        except TimeoutException:
+            return False
+
+    def return_to_overview(self, url):
+        if self.driver.find_elements(By.XPATH, tab_xpath("Reviews")):
+            return
+        try:
+            self.click(self.driver.find_element(By.XPATH, SEL["back"]))
+            self.wait(tab_xpath("Reviews"), 8)
+        except (WebDriverException, TimeoutException):
+            self.driver.get(english_url(url))
+            self.wait(SEL["heading"], 20)
+            self.pause()
+
+    def collect_hours(self, url):
+        buttons = self.driver.find_elements(By.XPATH, SEL["hours_button"])
+        if buttons:
+            try:
+                self.click(buttons[0])
+                try:
+                    self.wait(SEL["hours_table"], 6)
+                except TimeoutException:
+                    pass
+                for button in self.driver.find_elements(By.XPATH, SEL["hours_toggle"]):
+                    try:
+                        self.click(button)
+                    except WebDriverException:
+                        pass
+                self.pause(0.5, 1.0)
+            except WebDriverException:
+                pass
+        result = parse_hours(self.driver)
+        if buttons:
+            self.return_to_overview(url)
+        return result
+
+    def collect_reviews(self):
+        if not self.click_tab("Reviews"):
+            return []
+        try:
+            self.wait(SEL["review_card"], 15)
+        except TimeoutException:
+            return []
+        try:
+            self.click(self.wait(SEL["sort"], 8))
+            self.pause()
+            self.click(self.wait(SEL["newest"], 8))
+            self.pause(1.5, 2.5)
+        except TimeoutException:
+            pass
+
+        previous = -1
+        for _ in range(12):
+            cards = self.driver.find_elements(By.XPATH, SEL["review_card"])
+            if len(cards) >= REVIEWS_PER_PLACE or len(cards) == previous:
+                break
+            previous = len(cards)
+            if not cards:
+                break
+            self.driver.execute_script(
+                "let el=arguments[0]; while(el && el.scrollHeight<=el.clientHeight+5){el=el.parentElement;}"
+                "if(el){el.scrollTop=el.scrollHeight;}",
+                cards[-1],
+            )
+            self.pause(0.8, 1.5)
+
+        for button in self.driver.find_elements(By.XPATH, SEL["more"]):
+            try:
+                self.click(button)
+            except WebDriverException:
+                pass
+        self.pause(0.5, 1.0)
+        return parse_reviews(self.driver, REVIEWS_PER_PLACE)
+
+    def collect_about(self):
+        if not self.click_tab("About"):
+            return {}
+        try:
+            self.wait('//div[@role="region"][starts-with(@aria-label,"About")]//h2', 10)
+        except TimeoutException:
+            return {}
+        self.pause()
+        return parse_about(self.driver)
+
+    def scrape_place(self, url, rank):
+        self.driver.get(english_url(url))
+        self.wait(SEL["heading"], 20)
+        self.pause()
+        overview = parse_overview(self.driver)
+        current_url = self.driver.current_url
+        pid = place_id(current_url) or place_id(url)
+        if not overview["name"] or not pid:
+            print("Skipping place %d: missing name or place ID" % rank)
+            return None
+        category = (overview["category"] or "").lower()
+        if CATEGORY_KEYWORDS and category and not any(word in category for word in CATEGORY_KEYWORDS):
+            print("Skipping non-restaurant: %s (%s)" % (overview["name"], category))
+            return None
+
+        hours, other_hours = self.collect_hours(url)
+        reviews = self.collect_reviews()
+        about = self.collect_about()
+        return {
+            "scrape_timestamp": self.scraped_at,
+            "search_query": SEARCH_QUERY,
+            "search_rank": rank,
+            "place_id": pid,
+            "maps_url": current_url,
+            **overview,
+            **hours,
+            "other_hours": json.dumps(other_hours, ensure_ascii=False),
+            "reviews": json.dumps(reviews, ensure_ascii=False),
+            "about_sections": json.dumps(about, ensure_ascii=False),
+        }
+
+    def run(self):
+        rows = []
+        self.open_search()
+        links = self.collect_links(RESTAURANT_LIMIT * 3)
+        print("Found %d candidate places" % len(links))
+        failures = 0
+        for rank, url in enumerate(links, start=1):
+            if len(rows) >= RESTAURANT_LIMIT:
+                break
+            try:
+                row = self.scrape_place(url, rank)
+                failures = 0
+            except Exception as exc:
+                failures += 1
+                print("Place #%d failed: %s" % (rank, exc))
+                if failures >= 5:
+                    print("Stopping after five consecutive failures.")
+                    break
+                continue
+            if row:
+                rows.append(row)
+                print("[%d/%d] %s" % (len(rows), RESTAURANT_LIMIT, row["name"]))
+                self.pause(*PLACE_DELAY)
+
+        if rows:
+            fields = list(dict.fromkeys(key for row in rows for key in row))
+            with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as file:
+                writer = csv.DictWriter(file, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+        print("Saved %d rows to %s" % (len(rows), CSV_FILE))
+
+    def close(self):
+        self.driver.quit()
+
+
+if __name__ == "__main__":
+    scraper = GmapsRestaurantScraper()
+    try:
+        scraper.run()
+    finally:
+        scraper.close()

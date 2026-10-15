@@ -1,0 +1,571 @@
+import random
+import re
+import time
+from datetime import datetime, timezone
+from urllib.parse import quote_plus
+
+import scrapy
+from parsel import Selector
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+from gmaps.models import RestaurantFlat
+
+PLACE_ID_RE = re.compile(r"!1s(0x[0-9a-fA-F]+:0x[0-9a-fA-F]+)")
+PUA_RE = re.compile("[\ue000-\uf8ff]")
+DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+HOURS_COLUMNS = {day: day + "_timing" for day in DAYS}
+
+ABOUT_PREFIX = "about_"
+OTHER_COLUMN = "about_other"
+ABOUT_COLUMNS = {
+    column.name[len(ABOUT_PREFIX):].replace("_", " "): column.name
+    for column in RestaurantFlat.__table__.columns
+    if column.name.startswith(ABOUT_PREFIX) and column.name != OTHER_COLUMN
+}
+
+
+def clean(value):
+    if value is None:
+        return None
+    value = PUA_RE.sub("", str(value))
+    value = value.replace("\u202f", " ").replace("\u00a0", " ").replace("\u2009", " ")
+    value = re.sub(r"\s+", " ", value).strip()
+    return value or None
+
+
+def to_number(text, integer=False):
+    if not text:
+        return None
+    match = re.search(r"\d[\d,]*\.?\d*", text)
+    if not match:
+        return None
+    number = match.group(0).replace(",", "")
+    try:
+        return int(float(number)) if integer else float(number)
+    except ValueError:
+        return None
+
+
+def strip_label(label, prefix):
+    label = clean(label)
+    if label and label.lower().startswith(prefix.lower()):
+        label = clean(label[len(prefix):])
+    return label
+
+
+def extract_place_id(url):
+    match = PLACE_ID_RE.search(url or "")
+    return match.group(1) if match else None
+
+
+def with_english(url):
+    if "hl=en" in url:
+        return url
+    return url + ("&" if "?" in url else "?") + "hl=en"
+
+
+PRICE_TEXT_RE = re.compile(
+    r"(?:(?:Rs\.?|PKR|₨|\$|€|£)\s?\d[\d,]*(?:\s?[–-]\s?\d[\d,]*)?\+?)|(?<!\S)\${1,4}(?!\S)",
+    re.I,
+)
+
+
+def parse_price(sel):
+    for element in sel.xpath('//span[@role="img"]'):
+        text = clean(element.xpath("string(.)").get())
+        if text and PRICE_TEXT_RE.fullmatch(text):
+            return text
+    for label in sel.xpath("//*[@aria-label]/@aria-label").getall():
+        if label.strip().lower().startswith("price"):
+            value = strip_label(label, "Price:") or strip_label(label, "Price")
+            if value:
+                return value
+    main_text = clean(" ".join(sel.xpath('//div[@role="main"]//text()').getall())) or ""
+    match = PRICE_TEXT_RE.search(main_text[:2000])
+    return clean(match.group(0)) if match else None
+
+
+def parse_overview(sel):
+    name = clean(sel.xpath('string(//h1[contains(@class,"DUwDvf")])').get()) or clean(
+        sel.xpath("string(//h1)").get()
+    )
+
+    rating = to_number(
+        sel.xpath('//div[contains(@class,"F7nice")]//span[@aria-hidden="true"]/text()').get()
+    )
+    if rating is None:
+        rating = to_number(
+            sel.xpath('//span[@role="img"][contains(@aria-label,"stars")]/@aria-label').get()
+        )
+
+    review_count = to_number(
+        sel.xpath(
+            '//div[contains(@class,"F7nice")]//span[contains(@aria-label,"review")]/@aria-label'
+        ).get(),
+        integer=True,
+    )
+
+    price_range = parse_price(sel)
+
+    category = clean(sel.xpath('//button[contains(@jsaction,"category")]//text()').get())
+
+    address = strip_label(
+        sel.xpath('//button[@data-item-id="address"]/@aria-label').get(), "Address:"
+    )
+
+    phone = strip_label(
+        sel.xpath('//button[starts-with(@data-item-id,"phone:tel:")]/@aria-label').get(), "Phone:"
+    )
+    if not phone:
+        item_id = sel.xpath('//button[starts-with(@data-item-id,"phone:tel:")]/@data-item-id').get()
+        phone = clean(item_id.split("phone:tel:", 1)[1]) if item_id else None
+
+    website = clean(sel.xpath('//a[@data-item-id="authority"]/@href').get())
+
+    plus_code = strip_label(
+        sel.xpath('//button[@data-item-id="oloc"]/@aria-label').get(), "Plus code:"
+    )
+
+    return {
+        "name": name,
+        "category": category,
+        "rating": rating,
+        "review_count": review_count,
+        "price_range": price_range,
+        "address": address,
+        "phone": phone,
+        "website": website,
+        "plus_code": plus_code,
+    }
+
+
+def parse_hours(sel):
+    sections, seen = [], set()
+    for table in sel.xpath("//table[.//td]"):
+        days = {}
+        for row in table.xpath(".//tr[td]"):
+            cells = row.xpath("./td")
+            if len(cells) < 2:
+                continue
+            day = (clean(cells[0].xpath("string(.)").get()) or "").lower()
+            if day not in HOURS_COLUMNS:
+                continue
+            parts = [clean(li.xpath("string(.)").get()) for li in cells[1].xpath(".//li")]
+            parts = [p for p in parts if p]
+            days[day] = ", ".join(parts) if parts else clean(cells[1].xpath("string(.)").get())
+        if not days:
+            continue
+        title = clean(
+            table.xpath(
+                'string((ancestor::div[contains(@class,"OqCZI")][1]//div[@role="button"])[1])'
+            ).get()
+        )
+        key = (title, tuple(sorted(days.items())))
+        if key not in seen:
+            seen.add(key)
+            sections.append((title, days))
+
+    columns = {column: None for column in HOURS_COLUMNS.values()}
+    other = {}
+    for index, (title, days) in enumerate(sections):
+        if index == 0:
+            for day, timing in days.items():
+                columns[HOURS_COLUMNS[day]] = timing
+        else:
+            other[title or "section %d" % (index + 1)] = days
+    return columns, other
+
+
+def parse_reviews(sel, limit):
+    reviews, seen = [], set()
+    for card in sel.xpath('//div[@data-review-id][not(ancestor::div[@data-review-id])]'):
+        review_id = card.attrib.get("data-review-id")
+        if review_id in seen:
+            continue
+        seen.add(review_id)
+
+        text = clean(
+            " ".join(
+                card.xpath(
+                    './/span[contains(@class,"wiI7pd")]'
+                    '[not(ancestor::div[contains(@class,"CDe7pd")])]//text()'
+                ).getall()
+            )
+        )
+        reviews.append(
+            {
+                "reviewer_name": clean(card.xpath('.//div[contains(@class,"d4r55")]/text()').get()),
+                "rating": to_number(
+                    card.xpath(
+                        './/span[@role="img"][contains(@aria-label,"star")]/@aria-label'
+                    ).get()
+                ),
+                "date": clean(card.xpath('.//span[contains(@class,"rsqaWe")]/text()').get()),
+                "text": text,
+            }
+        )
+        if len(reviews) >= limit:
+            break
+    return reviews
+
+
+ABOUT_HEADINGS = './/h2[following-sibling::ul] | .//*[contains(@class,"iL3Qke")][following-sibling::ul]'
+NEGATIVE_RE = re.compile(r"^(no|not|doesn't|does not|isn't|is not|without)\b", re.I)
+
+
+def parse_about(sel):
+    scope_groups = (
+        list(sel.xpath('//div[@role="region"][starts-with(@aria-label,"About")]')),
+        list(sel.xpath('//div[@role="tabpanel"]')),
+        [sel],
+    )
+    sections = {}
+    for scopes in scope_groups:
+        for scope in scopes:
+            for heading in scope.xpath(ABOUT_HEADINGS):
+                title = clean(heading.xpath("string(.)").get())
+                if not title:
+                    continue
+                items = []
+                for li in heading.xpath("./following-sibling::ul[1]/li"):
+                    label = clean(" ".join(li.xpath(".//span[@aria-label]/@aria-label").getall()))
+                    if label and NEGATIVE_RE.match(label):
+                        continue
+                    text = (
+                        clean(" ".join(li.xpath(".//span[@aria-label]//text()").getall()))
+                        or clean(li.xpath("string(.)").get())
+                        or label
+                    )
+                    if text:
+                        items.append(text)
+                if items:
+                    sections.setdefault(title, items)
+        if sections:
+            break
+    return sections
+
+
+def split_about(sections):
+    columns = {column: None for column in ABOUT_COLUMNS.values()}
+    other = {}
+    for title, items in sections.items():
+        column = ABOUT_COLUMNS.get(title.lower())
+        if column:
+            columns[column] = items
+        else:
+            other[title] = items
+    return columns, other
+
+
+def build_item(scraped_at, query, rank, place_id, overview, hours, other_hours, reviews, about_columns, about_other):
+    item = {
+        "scrape_timestamp": scraped_at,
+        "search_query": query,
+        "search_rank": rank,
+        "place_id": place_id,
+    }
+    item.update(overview)
+    item.update(hours)
+    item["other_hours"] = other_hours or None
+    item["reviews"] = reviews
+    item.update(about_columns)
+    item[OTHER_COLUMN] = about_other or None
+    return item
+
+
+SEL = {
+    "consent": '//button[contains(normalize-space(.),"Accept all") or contains(normalize-space(.),"Reject all")]',
+    "feed": '//div[@role="feed"]',
+    "heading": "//h1",
+    "end_of_list": '//span[contains(text(),"reached the end")]',
+    "hours_button": '//button[@data-item-id="oh"]',
+    "hours_table": '//table[contains(@class,"eK4R0e")]',
+    "hours_section_toggle": '//div[@role="button"][@aria-expanded="false"][contains(@jsaction,"openhours")]',
+    "back_button": '//button[@aria-label="Back"]',
+    "review_card": '//div[@data-review-id][not(ancestor::div[@data-review-id])]',
+    "sort_button": '//button[contains(@aria-label,"Sort") or @data-value="Sort" or normalize-space(.)="Sort"]',
+    "sort_newest": '//*[@role="menuitemradio"][contains(normalize-space(.),"Newest")]',
+    "more_button": '//div[@data-review-id]//button[contains(@aria-label,"See more") or normalize-space(.)="More"]',
+    "about_heading": "//h2[following-sibling::ul]",
+}
+
+
+def tab_xpath(label):
+    return '//button[@role="tab"][starts-with(@aria-label,"%s") or normalize-space(.)="%s"]' % (
+        label, label,
+    )
+
+
+class GmapsRestaurantSpider(scrapy.Spider):
+    name = "gmaps_restaurants"
+
+    def __init__(self, query=None, limit=None, reviews=None, headless=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._args = {"query": query, "limit": limit, "reviews": reviews, "headless": headless}
+        self.scraped_at = datetime.now(timezone.utc).isoformat()
+        self.driver = None
+
+    def load_options(self):
+        settings, args = self.settings, self._args
+        self.query = args["query"] or settings.get("SEARCH_QUERY", "restaurants in Lahore")
+        self.limit = int(args["limit"] or settings.getint("RESTAURANT_LIMIT", 40))
+        self.reviews_per_place = int(args["reviews"] or settings.getint("REVIEWS_PER_PLACE", 10))
+        if args["headless"] is None:
+            self.headless = settings.getbool("SELENIUM_HEADLESS", True)
+        else:
+            self.headless = str(args["headless"]).lower() in ("1", "true", "yes")
+        self.keywords = [k.lower() for k in settings.getlist("RESTAURANT_CATEGORY_KEYWORDS")]
+        self.action_delay = tuple(settings.getlist("ACTION_DELAY") or (0.8, 1.8))
+        self.place_delay = tuple(settings.getlist("PLACE_DELAY") or (2.0, 5.0))
+
+        model_columns = {c.name for c in RestaurantFlat.__table__.columns}
+        missing = [c for c in HOURS_COLUMNS.values() if c not in model_columns]
+        if missing:
+            raise ValueError("models.py is missing hours columns: %s" % missing)
+
+    async def start(self):
+        for request in self.start_requests():
+            yield request
+
+    def start_requests(self):
+        self.load_options()
+        yield scrapy.Request("data:,", callback=self.crawl, dont_filter=True)
+
+    def closed(self, reason):
+        self.close_driver()
+
+    def crawl(self, response):
+        self.driver = self.make_driver()
+        accepted = failures = 0
+        try:
+            self.open_search()
+            links = self.collect_links(self.limit * 3)
+            self.logger.info("Found %d candidate places for %r", len(links), self.query)
+
+            for rank, url in enumerate(links, start=1):
+                if accepted >= self.limit:
+                    break
+                try:
+                    item = self.scrape_place(url, rank)
+                    failures = 0
+                except Exception as exc:
+                    failures += 1
+                    self.logger.error("Place #%d failed (%s): %r", rank, url[:90], exc)
+                    if failures >= 5:
+                        self.logger.error("5 failures in a row, stopping (blocked or browser crashed?)")
+                        break
+                    continue
+
+                if item is None:
+                    continue
+                accepted += 1
+                self.logger.info("[%d/%d] %s", accepted, self.limit, item["name"])
+                yield item
+                self.pause(*self.place_delay)
+        finally:
+            self.close_driver()
+
+    def make_driver(self):
+        options = webdriver.ChromeOptions()
+        if self.headless:
+            options.add_argument("--headless=new")
+        options.add_argument("--window-size=1400,1000")
+        options.add_argument("--lang=en-US")
+        options.add_experimental_option("prefs", {"intl.accept_languages": "en-US,en"})
+        return webdriver.Chrome(options=options)
+
+    def close_driver(self):
+        if self.driver is not None:
+            try:
+                self.driver.quit()
+            except WebDriverException:
+                pass
+            self.driver = None
+
+    def pause(self, low=None, high=None):
+        low, high = (low, high) if low is not None else self.action_delay
+        time.sleep(random.uniform(low, high))
+
+    def js_click(self, element):
+        self.driver.execute_script("arguments[0].click();", element)
+
+    def wait_for(self, xpath, seconds=15):
+        return WebDriverWait(self.driver, seconds).until(
+            EC.presence_of_element_located((By.XPATH, xpath))
+        )
+
+    def open_search(self):
+        self.driver.get("https://www.google.com/maps/search/%s?hl=en" % quote_plus(self.query))
+        try:
+            self.js_click(self.wait_for(SEL["consent"], 4))
+            self.pause()
+        except TimeoutException:
+            pass
+        self.wait_for(SEL["feed"], 20)
+
+    def collect_links(self, wanted):
+        links, seen, idle = [], set(), 0
+        while len(links) < wanted and idle < 4:
+            feed = self.driver.find_element(By.XPATH, SEL["feed"])
+            hrefs = self.driver.execute_script(
+                "return Array.from(arguments[0].querySelectorAll('a[href*=\"/maps/place/\"]'))"
+                ".map(a => a.href);",
+                feed,
+            )
+            grew = False
+            for href in hrefs:
+                key = extract_place_id(href) or href
+                if key not in seen:
+                    seen.add(key)
+                    links.append(href)
+                    grew = True
+            if self.driver.find_elements(By.XPATH, SEL["end_of_list"]):
+                break
+            idle = 0 if grew else idle + 1
+            self.driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", feed)
+            self.pause(1.0, 2.0)
+        return links
+
+    def scrape_place(self, url, rank):
+        driver = self.driver
+        driver.get(with_english(url))
+        self.wait_for(SEL["heading"], 20)
+        self.pause()
+
+        page = Selector(text=driver.page_source)
+
+        overview = parse_overview(page)
+        overview["maps_url"] = driver.current_url
+        place_id = extract_place_id(driver.current_url) or extract_place_id(url)
+        if not overview["name"] or not place_id:
+            self.logger.error("Place #%d: no name/id found, skipped (%s)", rank, url[:90])
+            return None
+        if not self.is_restaurant(overview["category"]):
+            self.logger.info("Skipping non-restaurant: %s (%s)", overview["name"], overview["category"])
+            return None
+
+        hours, other_hours = self.collect_hours(url, rank)
+        reviews = self.collect_reviews()
+        about_columns, about_other = split_about(self.collect_about(rank))
+
+        return build_item(
+            self.scraped_at, self.query, rank, place_id,
+            overview, hours, other_hours, reviews, about_columns, about_other,
+        )
+
+    def is_restaurant(self, category):
+        if not self.keywords or not category:
+            return True
+        category = category.lower()
+        return any(word in category for word in self.keywords)
+
+    def collect_hours(self, url, rank):
+        driver = self.driver
+        buttons = driver.find_elements(By.XPATH, SEL["hours_button"])
+        if buttons:
+            try:
+                self.js_click(buttons[0])
+                try:
+                    self.wait_for(SEL["hours_table"], 6)
+                except TimeoutException:
+                    self.logger.warning("Place #%d: hours opened but no table appeared", rank)
+                for header in driver.find_elements(By.XPATH, SEL["hours_section_toggle"]):
+                    try:
+                        self.js_click(header)
+                    except WebDriverException:
+                        pass
+                self.pause(0.5, 1.0)
+            except WebDriverException as exc:
+                self.logger.warning("Place #%d: could not open hours: %r", rank, exc)
+
+        result = parse_hours(Selector(text=driver.page_source))
+        if buttons:
+            self.return_to_overview(url)
+        return result
+
+    def return_to_overview(self, url):
+        driver = self.driver
+        if driver.find_elements(By.XPATH, tab_xpath("Reviews")):
+            return
+        try:
+            self.js_click(driver.find_element(By.XPATH, SEL["back_button"]))
+            self.wait_for(tab_xpath("Reviews"), 8)
+            return
+        except (WebDriverException, TimeoutException):
+            pass
+        driver.get(with_english(url))
+        self.wait_for(SEL["heading"], 20)
+        self.pause()
+
+    def click_tab(self, label):
+        try:
+            self.js_click(self.wait_for(tab_xpath(label), 10))
+            self.pause()
+            return True
+        except TimeoutException:
+            self.logger.warning("Tab %r not found", label)
+            return False
+
+    def collect_reviews(self):
+        driver = self.driver
+        if not self.click_tab("Reviews"):
+            return []
+        try:
+            self.wait_for(SEL["review_card"], 15)
+        except TimeoutException:
+            return []
+
+        self.sort_newest()
+
+        previous = -1
+        for _ in range(12):
+            cards = driver.find_elements(By.XPATH, SEL["review_card"])
+            if len(cards) >= self.reviews_per_place or len(cards) == previous:
+                break
+            previous = len(cards)
+            driver.execute_script(
+                "let el = arguments[0];"
+                "while (el && el.scrollHeight <= el.clientHeight + 5) { el = el.parentElement; }"
+                "if (el) { el.scrollTop = el.scrollHeight; }",
+                cards[-1],
+            )
+            self.pause(0.8, 1.5)
+
+        for button in driver.find_elements(By.XPATH, SEL["more_button"]):
+            try:
+                self.js_click(button)
+            except WebDriverException:
+                pass
+        self.pause(0.5, 1.0)
+
+        return parse_reviews(Selector(text=driver.page_source), self.reviews_per_place)
+
+    def sort_newest(self):
+        try:
+            self.js_click(self.wait_for(SEL["sort_button"], 8))
+            self.pause()
+            self.js_click(self.wait_for(SEL["sort_newest"], 8))
+            self.pause(1.5, 2.5)
+        except TimeoutException:
+            self.logger.warning("Could not switch reviews to 'Newest' (kept Maps' default order)")
+
+    def collect_about(self, rank):
+        if not self.click_tab("About"):
+            self.logger.warning("Place #%d: About tab not found", rank)
+            return {}
+        try:
+            self.wait_for(SEL["about_heading"], 10)
+        except TimeoutException:
+            self.logger.warning("Place #%d: About tab opened but no section headings appeared", rank)
+            return {}
+        self.pause()
+        sections = parse_about(Selector(text=self.driver.page_source))
+        if sections:
+            self.logger.info("Place #%d About sections: %s", rank, list(sections))
+        else:
+            self.logger.warning("Place #%d: About headings found but no items parsed", rank)
+        return sections

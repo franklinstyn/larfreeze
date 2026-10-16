@@ -75,99 +75,59 @@ PRICE_TEXT_RE = re.compile(
 
 
 def parse_price(sel):
-    for element in sel.xpath('//span[@role="img"]'):
-        text = clean(element.xpath("string(.)").get())
-        if text and PRICE_TEXT_RE.fullmatch(text):
-            return text
-    for label in sel.xpath("//*[@aria-label]/@aria-label").getall():
-        if label.strip().lower().startswith("price"):
-            value = strip_label(label, "Price:") or strip_label(label, "Price")
-            if value:
-                return value
-    main_text = clean(" ".join(sel.xpath('//div[@role="main"]//text()').getall())) or ""
-    match = PRICE_TEXT_RE.search(main_text[:2000])
+    # None of the saved places showed a price, so this lookup is unconfirmed.
+    # It only looks in the name/rating/category block at the top of the panel.
+    block = clean(sel.xpath('string(//div[contains(@class,"lMbq3e")])').get()) or ""
+    match = PRICE_TEXT_RE.search(block)
     return clean(match.group(0)) if match else None
 
 
 def parse_overview(sel):
-    name = clean(sel.xpath('string(//h1[contains(@class,"DUwDvf")])').get()) or clean(
-        sel.xpath("string(//h1)").get()
-    )
-
-    rating = to_number(
-        sel.xpath('//div[contains(@class,"F7nice")]//span[@aria-hidden="true"]/text()').get()
-    )
-    if rating is None:
-        rating = to_number(
-            sel.xpath('//span[@role="img"][contains(@aria-label,"stars")]/@aria-label').get()
-        )
-
-    review_count = to_number(
-        sel.xpath(
-            '//div[contains(@class,"F7nice")]//span[contains(@aria-label,"review")]/@aria-label'
-        ).get(),
-        integer=True,
-    )
-
-    price_range = parse_price(sel)
-
-    category = clean(sel.xpath('//button[contains(@jsaction,"category")]//text()').get())
-
-    address = strip_label(
-        sel.xpath('//button[@data-item-id="address"]/@aria-label').get(), "Address:"
-    )
-
-    phone = strip_label(
-        sel.xpath('//button[starts-with(@data-item-id,"phone:tel:")]/@aria-label').get(), "Phone:"
-    )
-    if not phone:
-        item_id = sel.xpath('//button[starts-with(@data-item-id,"phone:tel:")]/@data-item-id').get()
-        phone = clean(item_id.split("phone:tel:", 1)[1]) if item_id else None
-
-    website = clean(sel.xpath('//a[@data-item-id="authority"]/@href').get())
-
-    plus_code = strip_label(
-        sel.xpath('//button[@data-item-id="oloc"]/@aria-label').get(), "Plus code:"
-    )
-
     return {
-        "name": name,
-        "category": category,
-        "rating": rating,
-        "review_count": review_count,
-        "price_range": price_range,
-        "address": address,
-        "phone": phone,
-        "website": website,
-        "plus_code": plus_code,
+        "name": clean(sel.xpath('string(//h1[contains(@class,"DUwDvf")])').get()),
+        "category": clean(sel.xpath('//button[contains(@jsaction,"category")]//text()').get()),
+        "rating": to_number(
+            sel.xpath('//div[contains(@class,"F7nice")]//span[@aria-hidden="true"]/text()').get()
+        ),
+        "review_count": to_number(
+            sel.xpath(
+                '//div[contains(@class,"F7nice")]//span[contains(@aria-label,"review")]/@aria-label'
+            ).get(),
+            integer=True,
+        ),
+        "price_range": parse_price(sel),
+        "address": strip_label(
+            sel.xpath('//button[@data-item-id="address"]/@aria-label').get(), "Address:"
+        ),
+        "phone": strip_label(
+            sel.xpath('//button[starts-with(@data-item-id,"phone:tel:")]/@aria-label').get(), "Phone:"
+        ),
+        "website": clean(sel.xpath('//a[@data-item-id="authority"]/@href').get()),
+        "plus_code": strip_label(
+            sel.xpath('//button[@data-item-id="oloc"]/@aria-label').get(), "Plus code:"
+        ),
     }
 
 
 def parse_hours(sel):
-    sections, seen = [], set()
-    for table in sel.xpath("//table[.//td]"):
+    # One table per section (the first is the main opening hours; Dinner / Delivery / ... follow).
+    # The rating histogram is also a <table>, which is why the class is part of the selector.
+    sections = []
+    for table in sel.xpath('//table[contains(@class,"eK4R0e")]'):
         days = {}
         for row in table.xpath(".//tr[td]"):
             cells = row.xpath("./td")
-            if len(cells) < 2:
-                continue
             day = (clean(cells[0].xpath("string(.)").get()) or "").lower()
             if day not in HOURS_COLUMNS:
                 continue
             parts = [clean(li.xpath("string(.)").get()) for li in cells[1].xpath(".//li")]
-            parts = [p for p in parts if p]
-            days[day] = ", ".join(parts) if parts else clean(cells[1].xpath("string(.)").get())
-        if not days:
-            continue
+            days[day] = ", ".join(part for part in parts if part)
         title = clean(
             table.xpath(
                 'string((ancestor::div[contains(@class,"OqCZI")][1]//div[@role="button"])[1])'
             ).get()
         )
-        key = (title, tuple(sorted(days.items())))
-        if key not in seen:
-            seen.add(key)
-            sections.append((title, days))
+        sections.append((title, days))
 
     columns = {column: None for column in HOURS_COLUMNS.values()}
     other = {}
@@ -181,71 +141,39 @@ def parse_hours(sel):
 
 
 def parse_reviews(sel, limit):
-    reviews, seen = [], set()
-    for card in sel.xpath('//div[@data-review-id][not(ancestor::div[@data-review-id])]'):
-        review_id = card.attrib.get("data-review-id")
-        if review_id in seen:
-            continue
-        seen.add(review_id)
-
-        text = clean(
-            " ".join(
-                card.xpath(
-                    './/span[contains(@class,"wiI7pd")]'
-                    '[not(ancestor::div[contains(@class,"CDe7pd")])]//text()'
-                ).getall()
-            )
-        )
+    reviews = []
+    for card in sel.xpath('//div[contains(@class,"jftiEf")][@data-review-id]')[:limit]:
         reviews.append(
             {
                 "reviewer_name": clean(card.xpath('.//div[contains(@class,"d4r55")]/text()').get()),
                 "rating": to_number(
-                    card.xpath(
-                        './/span[@role="img"][contains(@aria-label,"star")]/@aria-label'
-                    ).get()
+                    card.xpath('.//span[@role="img"][contains(@aria-label,"star")]/@aria-label').get()
                 ),
                 "date": clean(card.xpath('.//span[contains(@class,"rsqaWe")]/text()').get()),
-                "text": text,
+                "text": clean(card.xpath('string((.//span[contains(@class,"wiI7pd")])[1])').get()),
             }
         )
-        if len(reviews) >= limit:
-            break
     return reviews
 
 
-ABOUT_HEADINGS = './/h2[following-sibling::ul] | .//*[contains(@class,"iL3Qke")][following-sibling::ul]'
-NEGATIVE_RE = re.compile(r"^(no|not|doesn't|does not|isn't|is not|without)\b", re.I)
+ABOUT_HEADINGS = '//div[@role="region"][starts-with(@aria-label,"About ")]//h2[following-sibling::ul]'
+NEGATIVE_RE = re.compile(r"^no\b", re.I)    # e.g. "No wheelchair accessible restroom"
 
 
 def parse_about(sel):
-    scope_groups = (
-        list(sel.xpath('//div[@role="region"][starts-with(@aria-label,"About")]')),
-        list(sel.xpath('//div[@role="tabpanel"]')),
-        [sel],
-    )
     sections = {}
-    for scopes in scope_groups:
-        for scope in scopes:
-            for heading in scope.xpath(ABOUT_HEADINGS):
-                title = clean(heading.xpath("string(.)").get())
-                if not title:
-                    continue
-                items = []
-                for li in heading.xpath("./following-sibling::ul[1]/li"):
-                    label = clean(" ".join(li.xpath(".//span[@aria-label]/@aria-label").getall()))
-                    if label and NEGATIVE_RE.match(label):
-                        continue
-                    text = (
-                        clean(" ".join(li.xpath(".//span[@aria-label]//text()").getall()))
-                        or clean(li.xpath("string(.)").get())
-                        or label
-                    )
-                    if text:
-                        items.append(text)
-                if items:
-                    sections.setdefault(title, items)
-        if sections:
-            break
+    for heading in sel.xpath(ABOUT_HEADINGS):
+        title = clean(heading.xpath("string(.)").get())
+        items = []
+        for li in heading.xpath("./following-sibling::ul[1]/li"):
+            label = clean(li.xpath("string(.//span[@aria-label]/@aria-label)").get())
+            if label and NEGATIVE_RE.match(label):
+                continue
+            text = clean(li.xpath("string(.//span[@aria-label])").get())
+            if text:
+                items.append(text)
+        if items:
+            sections[title] = items
     return sections
 
 
@@ -278,26 +206,26 @@ def build_item(scraped_at, query, rank, place_id, overview, hours, other_hours, 
 
 
 SEL = {
+    # search page (not covered by the saved HTML, unchanged)
     "consent": '//button[contains(normalize-space(.),"Accept all") or contains(normalize-space(.),"Reject all")]',
     "feed": '//div[@role="feed"]',
-    "heading": "//h1",
     "end_of_list": '//span[contains(text(),"reached the end")]',
+    # place page
+    "heading": "//h1",
     "hours_button": '//button[@data-item-id="oh"]',
     "hours_table": '//table[contains(@class,"eK4R0e")]',
     "hours_section_toggle": '//div[@role="button"][@aria-expanded="false"][contains(@jsaction,"openhours")]',
     "back_button": '//button[@aria-label="Back"]',
-    "review_card": '//div[@data-review-id][not(ancestor::div[@data-review-id])]',
-    "sort_button": '//button[contains(@aria-label,"Sort") or @data-value="Sort" or normalize-space(.)="Sort"]',
-    "sort_newest": '//*[@role="menuitemradio"][contains(normalize-space(.),"Newest")]',
-    "more_button": '//div[@data-review-id]//button[contains(@aria-label,"See more") or normalize-space(.)="More"]',
-    "about_heading": "//h2[following-sibling::ul]",
+    "review_card": '//div[contains(@class,"jftiEf")][@data-review-id]',
+    "sort_button": '//button[@aria-label="Sort reviews"]',
+    "sort_newest": '//*[@role="menuitemradio"][contains(normalize-space(.),"Newest")]',   # unconfirmed
+    "more_button": '//div[contains(@class,"jftiEf")]//button[@aria-label="See more"]',
+    "about_heading": ABOUT_HEADINGS,
 }
 
 
 def tab_xpath(label):
-    return '//button[@role="tab"][starts-with(@aria-label,"%s") or normalize-space(.)="%s"]' % (
-        label, label,
-    )
+    return '//button[@role="tab"][starts-with(@aria-label,"%s")]' % label
 
 
 class GmapsRestaurantSpider(scrapy.Spider):
@@ -436,9 +364,7 @@ class GmapsRestaurantSpider(scrapy.Spider):
         self.wait_for(SEL["heading"], 20)
         self.pause()
 
-        page = Selector(text=driver.page_source)
-
-        overview = parse_overview(page)
+        overview = parse_overview(Selector(text=driver.page_source))
         overview["maps_url"] = driver.current_url
         place_id = extract_place_id(driver.current_url) or extract_place_id(url)
         if not overview["name"] or not place_id:
@@ -464,6 +390,8 @@ class GmapsRestaurantSpider(scrapy.Spider):
         return any(word in category for word in self.keywords)
 
     def collect_hours(self, url, rank):
+        # Two layouts: the table is already on the overview (no button), or the
+        # "oh" button opens a sub-pane with one collapsible table per section.
         driver = self.driver
         buttons = driver.find_elements(By.XPATH, SEL["hours_button"])
         if buttons:

@@ -1,0 +1,43 @@
+def collect_hours(self, url):
+    opened_detail = False
+
+    # Open the detailed hours page if the button exists.
+    buttons = self.driver.find_elements(By.XPATH, SEL["hours_button"])
+
+    if buttons:
+        try:
+            self.click(buttons[0])
+            opened_detail = True
+
+            try:
+                self.wait(SEL["hours_table"], 6)
+            except TimeoutException:
+                pass
+
+        except WebDriverException:
+            pass
+
+    # Expand collapsed hours tables, even when there is no hours button.
+    for _ in range(10):
+        collapsed = self.driver.find_elements(
+            By.XPATH, SEL["hours_toggle"]
+        )
+
+        if not collapsed:
+            break
+
+        try:
+            self.click(collapsed[0])
+            self.pause(0.3, 0.5)
+        except WebDriverException:
+            break
+
+    self.pause(0.5, 1.0)
+
+    result = parse_hours(self.driver)
+
+    # Return to the overview only if we opened the detailed hours page.
+    if opened_detail:
+        self.return_to_overview(url)
+
+    return result

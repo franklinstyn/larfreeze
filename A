@@ -1,47 +1,30 @@
 
-from pathlib import Path
-from avalon.gcs_upload import upload_to_gcs
+import pandas as pd
+from scrapy.exporters import BaseItemExporter
+from itemadapter import ItemAdapter
 
 
-class GCSPipeline:
-    def open_spider(self, spider):
-        self.settings = spider.settings
-        self.output_dir = Path(
-            self.settings.get("EXPORT_DIR")
-        )
+class ParquetItemExporter(BaseItemExporter):
+    def __init__(self, file, **kwargs):
+        super().__init__(**kwargs)
+        self.file = file
+        self.rows = []
+        self.fields = kwargs.get("fields")
 
-    def process_item(self, item, spider):
-        return item
+    def export_item(self, item):
+        row = ItemAdapter(item).asdict()
 
-    def close_spider(self, spider):
-        if not self.settings.getbool("GCS_UPLOAD_ENABLED", False):
-            return
+        if self.fields:
+            row = {
+                field: row.get(field)
+                for field in self.fields
+            }
 
-        file_format = self.settings.get(
-            "GCS_UPLOAD_FORMAT", "csv"
-        ).lower()
+        self.rows.append(row)
 
-        if file_format not in ("csv", "parquet"):
-            raise ValueError(
-                "GCS_UPLOAD_FORMAT must be csv or parquet"
+    def finish_exporting(self):
+        if self.rows:
+            pd.DataFrame(self.rows).to_parquet(
+                self.file,
+                index=False,
             )
-
-        file_name = self.settings.get(
-            "CSV_FILE_NAME" if file_format == "csv"
-            else "PARQUET_FILE_NAME"
-        )
-
-        file_path = self.output_dir / file_name
-
-        if not file_path.exists():
-            spider.logger.warning(
-                "GCS upload file not found: %s", file_path
-            )
-            return
-
-        upload_to_gcs(
-            file_path,
-            self.settings.get("GCS_CREDENTIALS"),
-            self.settings.get("GCS_BUCKET_NAME"),
-            self.settings.get("GCS_BLOB_PREFIX", ""),
-        )

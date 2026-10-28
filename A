@@ -1,0 +1,47 @@
+
+from pathlib import Path
+from avalon.gcs_upload import upload_to_gcs
+
+
+class GCSPipeline:
+    def open_spider(self, spider):
+        self.settings = spider.settings
+        self.output_dir = Path(
+            self.settings.get("EXPORT_DIR")
+        )
+
+    def process_item(self, item, spider):
+        return item
+
+    def close_spider(self, spider):
+        if not self.settings.getbool("GCS_UPLOAD_ENABLED", False):
+            return
+
+        file_format = self.settings.get(
+            "GCS_UPLOAD_FORMAT", "csv"
+        ).lower()
+
+        if file_format not in ("csv", "parquet"):
+            raise ValueError(
+                "GCS_UPLOAD_FORMAT must be csv or parquet"
+            )
+
+        file_name = self.settings.get(
+            "CSV_FILE_NAME" if file_format == "csv"
+            else "PARQUET_FILE_NAME"
+        )
+
+        file_path = self.output_dir / file_name
+
+        if not file_path.exists():
+            spider.logger.warning(
+                "GCS upload file not found: %s", file_path
+            )
+            return
+
+        upload_to_gcs(
+            file_path,
+            self.settings.get("GCS_CREDENTIALS"),
+            self.settings.get("GCS_BUCKET_NAME"),
+            self.settings.get("GCS_BLOB_PREFIX", ""),
+        )
